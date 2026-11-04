@@ -15,6 +15,7 @@ mod highlight;
 mod home;
 mod html;
 mod input;
+mod local_file;
 mod modes;
 #[cfg(target_os = "macos")]
 mod native_header;
@@ -108,6 +109,7 @@ fn main() {
         editor::keymap::bind_keys(cx);
         editor::image::bind_keys(cx);
         app::bind_keys(cx);
+        local_file::install(cx);
         settings::load();
         settings::apply_appearance(&settings::prefs().appearance);
         settings::sync_dark(cx);
@@ -119,6 +121,8 @@ fn main() {
         app::set_menus(cx);
         update::init(cx);
         open_main_window(scripted, cx);
+        let paths: Vec<_> = std::env::args_os().skip(1).filter(|p| !p.to_string_lossy().starts_with("-psn_")).map(std::path::PathBuf::from).collect();
+        local_file::open_paths(&paths, cx);
         cx.on_window_closed(move |cx| {
             if (!quick_enabled || !cfg!(target_os = "macos")) && cx.windows().is_empty() {
                 cx.quit();
