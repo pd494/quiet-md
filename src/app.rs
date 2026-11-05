@@ -730,7 +730,7 @@ impl Workspace {
         let again = vault.clone();
         if !self.save_before(cx, move |w, window, cx| w.use_library(again, window, cx)) { return; }
         let opened = match &vault { Some(v) => crate::store::Store::open_vault(v), None => crate::store::Store::open() };
-        let saved = opened.and_then(|store| { crate::settings::set_vault(vault)?; Ok(store) });
+        let saved = opened.and_then(|store| { crate::settings::set_vault(store.vault().map(std::path::Path::to_path_buf))?; Ok(store) });
         match saved {
             Ok(store) => self.store.switch(store),
             Err(e) => return self.show_toast_kind(ToastKind::Error, &crate::localized_format!("无法打开：{}", "Could not open: {}", e), cx),
