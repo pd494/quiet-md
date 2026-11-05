@@ -100,6 +100,7 @@ fn info(name: &str) -> Option<(usize, &'static str, &'static str)> {
         "ToggleShortcuts" => (0, "查看快捷键", "Show shortcuts"),
         "ImportDoc" => (1, "导入文档", "Import documents"),
         "OpenLocalFile" => (1, "打开本地文件", "Open local file"),
+        "OpenVault" => (1, "打开 Obsidian 库", "Open vault"),
         "Save" => (1, "保存文档", "Save document"),
         "EditMode" => (1, "编辑模式", "Edit mode"),
         "ReadMode" => (1, "阅读模式", "Reading mode"),

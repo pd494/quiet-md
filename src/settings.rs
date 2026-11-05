@@ -39,10 +39,16 @@ pub struct Preferences {
     pub auto_update: bool,
     /// Light or dark look: "light", "dark", or empty to follow the system.
     pub appearance: String,
+    /// The Obsidian vault used as the library; `None` is the library itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vault: Option<std::path::PathBuf>,
+    /// Vaults added in 设置 › 文档库, to switch between.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub vaults: Vec<std::path::PathBuf>,
 }
 
 impl Default for Preferences {
-    fn default() -> Self { Preferences { theme: String::new(), feishu: true, english: true, remote_images: true, quick_hotkey: true, auto_update: true, appearance: String::new() } }
+    fn default() -> Self { Preferences { theme: String::new(), feishu: true, english: true, remote_images: true, quick_hotkey: true, auto_update: true, appearance: String::new(), vault: None, vaults: vec![] } }
 }
 
 impl Preferences {
@@ -114,6 +120,13 @@ fn save(p: &Preferences) -> anyhow::Result<()> {
     std::fs::rename(tmp, path())?;
     apply(p.clone());
     Ok(())
+}
+
+/// Use `vault` (`None`: the library), adding it to the list.
+pub(crate) fn set_vault(vault: Option<std::path::PathBuf>) -> anyhow::Result<()> {
+    let mut p = prefs();
+    if let Some(v) = &vault && !p.vaults.contains(v) { p.vaults.push(v.clone()); }
+    save(&Preferences { vault, ..p })
 }
 
 /// Redraw every window's document after the theme or language changed.
@@ -664,21 +677,47 @@ impl Workspace {
     }
 
     fn library_page(&self, cx: &mut Context<Self>) -> AnyElement {
-        let root = crate::store::Store::root_dir();
-        let location = if cfg!(target_os = "windows") { root.display().to_string() } else {
-            dirs::home_dir().and_then(|h| root.strip_prefix(h).ok().map(|r| format!("~/{}", r.display()))).unwrap_or_else(|| root.display().to_string())
+        let vault = self.store.vault();
+        let root = vault.clone().unwrap_or_else(crate::store::Store::root_dir);
+        let shown = |p: &std::path::Path| if cfg!(target_os = "windows") { p.display().to_string() } else {
+            dirs::home_dir().and_then(|h| p.strip_prefix(h).ok().map(|r| format!("~/{}", r.display()))).unwrap_or_else(|| p.display().to_string())
         };
         let reveal = if cfg!(target_os = "macos") { tr("在访达中显示", "Show in Finder") } else if cfg!(target_os = "windows") {
             tr("在文件资源管理器中显示", "Show in File Explorer")
         } else { tr("在文件管理器中显示", "Show in File Manager") };
-        div().w_full().flex().flex_col().gap(px(8.))
+        // The library, then every vault added, the one in use marked.
+        let vaults = prefs().vaults;
+        let choice = |ix: usize, target: Option<std::path::PathBuf>, cx: &mut Context<Self>| {
+            if target == vault { return div().px(px(4.)).text_size(px(12.)).text_color(Theme::text_caption()).child(tr("使用中", "In use")); }
+            div().flex().items_center().gap(px(8.))
+                .when_some(target.clone(), |d, path| d.child(link_button(SharedString::from(format!("vault-remove-{ix}")), tr("移除", "Remove"))
+                    .on_click(cx.listener(move |w, _, _, cx| w.forget_vault(&path, cx)))))
+                .child(button(SharedString::from(format!("vault-use-{ix}")), tr("使用", "Use")).on_click(cx.listener(move |w, _, _, cx| w.use_library(target.clone(), cx))))
+        };
+        let mut sources = vec![row(tr("文档库", "Library"), Some(shown(&crate::store::Store::root_dir()).into()), choice(0, None, cx)).into_any_element()];
+        for (i, v) in vaults.iter().enumerate() {
+            let name = v.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            sources.push(row(name, Some(shown(v).into()), choice(i + 1, Some(v.clone()), cx)).into_any_element());
+        }
+        sources.push(row(tr("添加 Obsidian 库", "Add Obsidian Vault"), Some(tr("选择一个 Markdown 文件夹，笔记直接读写原文件。", "Choose a Markdown folder; notes are read and saved in place.").into()),
+            button("open-vault", tr("选择文件夹…", "Choose Folder…")).on_click(cx.listener(|w, _, window, cx| w.open_vault(window, cx)))).into_any_element());
+        div().w_full().flex().flex_col().gap(px(24.))
+            .child(group(Some(tr("文档来源", "Where documents live")), sources))
             .child(group(None, vec![
-                row(tr("文档库文件夹", "Documents folder"), Some(location.into()),
-                    button("reveal-library", reveal).on_click(|_, _, cx| cx.reveal_path(&crate::store::Store::root_dir()))).into_any_element(),
+                row(tr("文档库文件夹", "Documents folder"), Some(shown(&root).into()),
+                    button("reveal-library", reveal).on_click(move |_, _, cx| cx.reveal_path(&root))).into_any_element(),
                 row(tr("回收站", "Trash"), Some(if english() { format!("Deleted documents are kept for {} days.", crate::store::TRASH_DAYS) } else { format!("删除的文档保留 {} 天后自动清除。", crate::store::TRASH_DAYS) }.into()),
                     button("open-trash", tr("打开", "Open")).on_click(cx.listener(|w, _, _, cx| w.show_view(View::Trash, cx)))).into_any_element(),
             ]))
             .into_any_element()
+    }
+
+    /// 移除: take a vault off the list (its files stay as they are).
+    fn forget_vault(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        let mut p = prefs();
+        p.vaults.retain(|v| v != path);
+        if let Err(e) = save(&p) { self.show_toast_kind(ui::ToastKind::Error, &format!("{}: {e}", tr("设置保存失败", "Could not save settings")), cx); }
+        cx.notify();
     }
 
     fn about_page(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1194,6 +1233,7 @@ pub(crate) fn localize(text: &str, english: bool) -> &str {
         "刚刚" => "just now",
         "文档不存在" => "Document not found",
         "文档已被另一个实例修改，未覆盖磁盘内容。请先将当前内容导出，再重新打开文档" => "Another instance modified this document. The file was not overwritten. Export your changes, then reopen the document.",
+        "只能移动到文件夹" => "Notes can only be moved into folders.",
         "这个文档库由更新版本的 quiet.md 创建，部分内容可能无法正确显示，请升级后再编辑" => "These documents were created by a newer version of quiet.md. Update the app before editing them.",
         _ => text,
     }

@@ -13,3 +13,4 @@ pub mod palette;
 pub mod paste;
 pub mod store;
 pub mod time;
+pub mod vault;
