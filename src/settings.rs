@@ -39,10 +39,13 @@ pub struct Preferences {
     pub auto_update: bool,
     /// Light or dark look: "light", "dark", or empty to follow the system.
     pub appearance: String,
+    /// The vault window open at last quit, reopened at launch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vault: Option<std::path::PathBuf>,
 }
 
 impl Default for Preferences {
-    fn default() -> Self { Preferences { theme: String::new(), feishu: true, english: true, remote_images: true, quick_hotkey: true, auto_update: true, appearance: String::new() } }
+    fn default() -> Self { Preferences { theme: String::new(), feishu: true, english: true, remote_images: true, quick_hotkey: true, auto_update: true, appearance: String::new(), vault: None } }
 }
 
 impl Preferences {
@@ -114,6 +117,10 @@ fn save(p: &Preferences) -> anyhow::Result<()> {
     std::fs::rename(tmp, path())?;
     apply(p.clone());
     Ok(())
+}
+
+pub(crate) fn set_vault(vault: Option<std::path::PathBuf>) -> anyhow::Result<()> {
+    save(&Preferences { vault, ..prefs() })
 }
 
 /// Redraw every window's document after the theme or language changed.
@@ -664,7 +671,8 @@ impl Workspace {
     }
 
     fn library_page(&self, cx: &mut Context<Self>) -> AnyElement {
-        let root = crate::store::Store::root_dir();
+        let vault = self.store.vault();
+        let root = vault.clone().unwrap_or_else(crate::store::Store::root_dir);
         let location = if cfg!(target_os = "windows") { root.display().to_string() } else {
             dirs::home_dir().and_then(|h| root.strip_prefix(h).ok().map(|r| format!("~/{}", r.display()))).unwrap_or_else(|| root.display().to_string())
         };
@@ -674,7 +682,11 @@ impl Workspace {
         div().w_full().flex().flex_col().gap(px(8.))
             .child(group(None, vec![
                 row(tr("文档库文件夹", "Documents folder"), Some(location.into()),
-                    button("reveal-library", reveal).on_click(|_, _, cx| cx.reveal_path(&crate::store::Store::root_dir()))).into_any_element(),
+                    button("reveal-library", reveal).on_click(move |_, _, cx| cx.reveal_path(&root))).into_any_element(),
+                row(tr("Obsidian 库", "Obsidian vault"), Some(tr("把一个 Markdown 文件夹当作文档库：笔记直接读写原文件。", "Use a Markdown folder as your documents: notes are read and saved in place.").into()),
+                    div().flex().items_center().gap(px(8.))
+                        .when(vault.is_some(), |d| d.child(button("use-library", tr("改用文档库", "Use Library")).on_click(cx.listener(|w, _, window, cx| w.use_library(None, window, cx)))))
+                        .child(button("open-vault", tr("选择文件夹…", "Choose Folder…")).on_click(cx.listener(|w, _, window, cx| w.open_vault(window, cx))))).into_any_element(),
                 row(tr("回收站", "Trash"), Some(if english() { format!("Deleted documents are kept for {} days.", crate::store::TRASH_DAYS) } else { format!("删除的文档保留 {} 天后自动清除。", crate::store::TRASH_DAYS) }.into()),
                     button("open-trash", tr("打开", "Open")).on_click(cx.listener(|w, _, _, cx| w.show_view(View::Trash, cx)))).into_any_element(),
             ]))
@@ -1194,6 +1206,7 @@ pub(crate) fn localize(text: &str, english: bool) -> &str {
         "刚刚" => "just now",
         "文档不存在" => "Document not found",
         "文档已被另一个实例修改，未覆盖磁盘内容。请先将当前内容导出，再重新打开文档" => "Another instance modified this document. The file was not overwritten. Export your changes, then reopen the document.",
+        "只能移动到文件夹" => "Notes can only be moved into folders.",
         "这个文档库由更新版本的 quiet.md 创建，部分内容可能无法正确显示，请升级后再编辑" => "These documents were created by a newer version of quiet.md. Update the app before editing them.",
         _ => text,
     }

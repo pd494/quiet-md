@@ -87,10 +87,11 @@ Core 的不变量由 `crates/core/src/editor/fuzz_tests.rs` 在每一步随机�
 |---|---|
 | `model.rs` | 文档模型，包括行内对象类型、`display_title` |
 | `docxml.rs` | DocxXML 解析与序列化；`to_inline` 构造行内对象 |
-| `store.rs` | 文档库读写、索引恢复、回收站、设置；`image_path` |
+| `store.rs` | 文档库读写、索引恢复、回收站、设置；`image_path`；文档库也可以是一个 Obsidian 库（见 FORMAT.md） |
 | `paste.rs` | HTML / Markdown → block（粘贴和导入共用） |
 | `markdown.rs` | 导出 Markdown |
-| `markdown_file.rs` | Markdown / MDX 文件读取、相对图片路径和原文件原子保存；复用现有 Markdown 转换和导出 |
+| `markdown_file.rs` | Markdown / MDX 文件读取和原文件原子保存（`FileDoc`）：保留 frontmatter，未改动的段落按原文写回，只重写编辑过的部分；文件被别的程序改过时不覆盖 |
+| `vault.rs` | Obsidian 库的笔记树：文件夹在前，跳过隐藏目录，标出只在 iCloud 的笔记 |
 | `lang.rs` | 代码语言表 |
 | `palette.rs` | 文字色、背景色、高亮块色板（RGBA，不依赖 GPUI；`theme.rs` 转成 GPUI 颜色） |
 | `time.rs` | 日期换算、本地时区、当前时间 |

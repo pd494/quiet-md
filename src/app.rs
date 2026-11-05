@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-actions!(workspace, [NewDoc, ImportDoc, OpenLocalFile, ToggleSidebar, FocusSearch, FindInDoc, ReplaceInDoc, OpenSettings, OpenAbout, CheckForUpdates, GoHome, CloseWindow, Quit,
+actions!(workspace, [NewDoc, ImportDoc, OpenLocalFile, OpenVault, ToggleSidebar, FocusSearch, FindInDoc, ReplaceInDoc, OpenSettings, OpenAbout, CheckForUpdates, GoHome, CloseWindow, Quit,
     HideApp, HideOthers, ShowAll, Minimize, Zoom, ToggleFullScreen]);
 
 /// The menu bar, in the interface language.
@@ -47,6 +47,7 @@ pub fn set_menus(cx: &mut App) {
                 MenuItem::action(tr("新建文档", "New Document"), NewDoc),
                 MenuItem::action(tr("新建笔记窗口", "New Note Window"), crate::quick_note::QuickNew),
                 MenuItem::action(tr("打开文件…", "Open File…"), OpenLocalFile),
+                MenuItem::action(tr("打开 Obsidian 库…", "Open Vault…"), OpenVault),
                 MenuItem::action(tr("导入为文档…", "Import as Document…"), ImportDoc),
                 MenuItem::separator(),
                 MenuItem::action(tr("关闭窗口", "Close Window"), CloseWindow),
@@ -88,6 +89,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-,", OpenSettings, None),
         KeyBinding::new("cmd-shift-i", ImportDoc, None),
         KeyBinding::new("cmd-o", OpenLocalFile, None),
+        KeyBinding::new("cmd-shift-o", OpenVault, None),
         KeyBinding::new("cmd-alt-home", GoHome, None),
         KeyBinding::new("cmd-w", CloseWindow, None),
         KeyBinding::new("cmd-]", ToggleSidebar, None),
@@ -375,6 +377,11 @@ impl Workspace {
                 }
                 last = now;
             }
+        })
+        .detach();
+        cx.spawn_in(window, async |this, cx| loop {
+            cx.background_executor().timer(Duration::from_secs(3)).await;
+            if this.update_in(cx, |w: &mut Workspace, window, cx| w.poll_vault(window, cx)).is_err() { break; }
         })
         .detach();
         let sidebar_width = store.settings().sidebar_width.unwrap_or(theme::SIDEBAR_WIDTH);
@@ -707,6 +714,63 @@ impl Workspace {
     }
 
     /// Switch the main pane to 主页 or 回收站 (or back to the document).
+    /// 打开 Obsidian 库: a Markdown folder becomes the library.
+    pub fn open_vault(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let picked = crate::devtools::take_pick();
+        let prompt = picked.is_none().then(|| cx.prompt_for_paths(PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some(crate::settings::tr("打开", "Open").into()), extensions: None }));
+        cx.spawn_in(window, async move |this, cx| {
+            let paths = match prompt { Some(p) => p.await.ok().and_then(Result::ok).flatten(), None => picked };
+            let Some(path) = paths.and_then(|p| p.into_iter().next()) else { return };
+            let _ = this.update_in(cx, |w, window, cx| w.use_library(Some(path), window, cx));
+        }).detach();
+    }
+
+    /// Every window switches to the vault (`None`: back to the library).
+    pub(crate) fn use_library(&mut self, vault: Option<std::path::PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        let again = vault.clone();
+        if !self.save_before(cx, move |w, window, cx| w.use_library(again, window, cx)) { return; }
+        let opened = match &vault { Some(v) => crate::store::Store::open_vault(v), None => crate::store::Store::open() };
+        let saved = opened.and_then(|store| { crate::settings::set_vault(vault)?; Ok(store) });
+        match saved {
+            Ok(store) => self.store.switch(store),
+            Err(e) => return self.show_toast_kind(ToastKind::Error, &crate::localized_format!("无法打开：{}", "Could not open: {}", e), cx),
+        }
+        self.library_switched(window, cx);
+        let me = cx.entity_id();
+        for w in cx.windows() {
+            if let Some(h) = w.downcast::<Workspace>() && h.is_active(cx).is_some() && h.entity(cx).is_ok_and(|e| e.entity_id() != me) {
+                let _ = h.update(cx, |ws, window, cx| ws.library_switched(window, cx));
+            }
+        }
+    }
+
+    fn library_switched(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.save_task = None;
+        self.unsaved = false;
+        self.current = None;
+        self.editor = None;
+        self.editor_sub = None;
+        self.entries = self.store.list();
+        self.sort();
+        self.show_view(View::Home, cx);
+    }
+
+    /// A vault changes under the app (Obsidian, iCloud from a phone): pick up
+    /// new and renamed notes, and reload the open one if it was not edited here.
+    fn poll_vault(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.store.vault().is_none() { return; }
+        let key = |es: &[crate::store::Entry]| es.iter().map(|e| (e.id.clone(), e.title.clone(), e.meta.modified, e.meta.parent.clone())).collect::<Vec<_>>();
+        let entries = self.store.list();
+        if key(&entries) != key(&self.entries) {
+            self.entries = entries;
+            self.sort();
+            cx.notify();
+        }
+        if let Some(id) = self.current.clone() && !self.unsaved && self.store.changed_on_disk(&id) {
+            self.open(&id, window, cx);
+        }
+    }
+
     pub fn show_view(&mut self, view: View, cx: &mut Context<Self>) {
         self.cancel_shortcut_recording(cx);
         if view == View::Trash {
@@ -1292,6 +1356,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|w, _: &GoHome, _, cx| w.show_view(View::Home, cx)))
             .on_action(cx.listener(|w, _: &NewDoc, window, cx| w.new_doc(window, cx)))
             .on_action(cx.listener(|w, _: &ImportDoc, window, cx| w.open_import(window, cx)))
+            .on_action(cx.listener(|w, _: &OpenVault, window, cx| w.open_vault(window, cx)))
             .on_action(cx.listener(|w, _: &ToggleSidebar, _, cx| {
                 w.sidebar_open = !w.sidebar_open;
                 cx.notify();

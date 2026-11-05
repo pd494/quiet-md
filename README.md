@@ -89,6 +89,7 @@
 - **整理**：文档树、置顶、收藏、全文搜索、回收站。
 - **导入导出**：导入 Markdown 和飞书 DocxXML；导出 Markdown、PDF，也可以直接打印。从飞书或网页粘贴时保留结构。
 - **本地文件**：通过「文件 → 打开文件…」（macOS `⌘O` / Windows `Ctrl+O`）或 `quiet_md /path/to/note.md` 打开本地 `.md` / `.mdx`，用现有编辑器预览和编辑，按 `⌘S` / `Ctrl+S` 保存回原文件。保存使用现有 Markdown 导出规则；MDX 按 Markdown 处理，不执行 JSX 组件。
+- **Obsidian 库**：在「设置 › 文档库」或「文件 → 打开 Obsidian 库…」（`⌘⇧O`）选择一个 Markdown 文件夹，它就成为文档库：笔记就是原来的 .md 文件，文件夹是父页面，搜索、主页、置顶、收藏、移动、重命名、回收站照常使用。frontmatter、`[[双链]]` 和 `#标签` 原样保留，没改动的段落逐字节不变；别处（例如手机上的 Obsidian 经 iCloud）改过的笔记会自动出现并重新载入。
 - **快捷键**：按 `⌘ /` 查看全部快捷键，每一个都能改。
 - **主题**：内置 Craft、飞书、Notion、Obsidian 四套风格，也可以用 CSS 自己写，见 [docs/THEMES.md](docs/THEMES.md)。
 
