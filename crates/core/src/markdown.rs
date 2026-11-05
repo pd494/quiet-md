@@ -13,6 +13,10 @@ pub struct Options<'a> {
     pub assets: Option<&'a str>,
     /// Saving an existing Markdown file keeps its image and attachment paths.
     pub preserve_paths: bool,
+    /// The file's own list style, when saving one: nested-list indent ("\t",
+    /// "  " …; default four spaces) and bullet ('*', '+'; default '-').
+    pub list_indent: Option<&'a str>,
+    pub bullet: Option<char>,
 }
 
 pub struct Export {
@@ -77,12 +81,12 @@ impl Writer<'_> {
             if b.children.is_empty() {
                 return head;
             }
-            format!("{head}\n{}", indent(&w.blocks(&b.children), "    "))
+            format!("{head}\n{}", indent(&w.blocks(&b.children), w.opts.list_indent.unwrap_or("    ")))
         };
         match &b.kind {
             BlockKind::Text => nested(self, text),
             BlockKind::Heading { level, .. } => nested(self, format!("{} {text}", "#".repeat((*level).clamp(1, 6) as usize))),
-            BlockKind::Bullet => nested(self, format!("- {text}")),
+            BlockKind::Bullet => nested(self, format!("{} {text}", self.opts.bullet.unwrap_or('-'))),
             BlockKind::Ordered { .. } => nested(self, format!("{seq}. {text}")),
             BlockKind::Todo { done } => nested(self, format!("- [{}] {text}", if *done { "x" } else { " " })),
             BlockKind::Code { lang, .. } => {
@@ -176,11 +180,22 @@ fn indent(s: &str, prefix: &str) -> String {
 
 fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
+    let mut rest = s;
+    while let Some(c) = rest.chars().next() {
+        // `[[wiki links]]` are already plain text to CommonMark.
+        if rest.starts_with("[[")
+            && let Some(end) = rest.find("]]")
+            && !rest[..end].contains('\n')
+        {
+            out.push_str(&rest[..end + 2]);
+            rest = &rest[end + 2..];
+            continue;
+        }
         if matches!(c, '\\' | '*' | '_' | '`' | '[' | ']' | '<' | '~') {
             out.push('\\');
         }
         out.push(c);
+        rest = &rest[c.len_utf8()..];
     }
     out
 }
@@ -260,7 +275,8 @@ fn inline(t: &RichText) -> String {
             x = format!("**{x}**");
         }
         if let Some(url) = &m.link {
-            x = format!("[{x}]({})", url.replace(' ', "%20").replace(')', "%29"));
+            // A bare URL stays bare (GFM and Obsidian link it).
+            x = if x == *url && url.starts_with("http") { x } else { format!("[{x}]({})", url.replace(' ', "%20").replace(')', "%29")) };
         }
         out.push_str(lead);
         out.push_str(&x);

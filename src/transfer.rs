@@ -227,7 +227,7 @@ impl Workspace {
         for p in paths {
             let ext = p.extension().and_then(|s| s.to_str()).unwrap_or_default().to_ascii_lowercase();
             let made = match ext.as_str() {
-                e if MARKDOWN_EXTS.contains(&e) => crate::markdown_file::read(p, true).map_err(anyhow::Error::from).and_then(|mut doc| {
+                e if MARKDOWN_EXTS.contains(&e) => crate::markdown_file::read(p).map_err(anyhow::Error::from).and_then(|mut doc| {
                     crate::editor::image::localize_pasted_images(&mut doc.blocks);
                     self.store.create_from(&doc)
                 }),

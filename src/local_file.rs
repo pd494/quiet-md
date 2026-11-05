@@ -20,15 +20,17 @@ pub fn install(cx: &mut App) {
 pub fn open_paths(paths: &[PathBuf], cx: &mut App) {
     for path in paths {
         if let Err(e) = open_path(path, cx) {
-            let message = crate::localized_format!("无法打开文件：{}", "Could not open file: {}", path.display());
-            let detail = e.to_string();
-            if let Some(handle) = cx.active_window().or_else(|| cx.windows().first().copied()) {
-                let _ = handle.update(cx, |_, window, cx| {
-                    let rx = window.prompt(PromptLevel::Critical, &message, Some(&detail), &[tr("确定", "OK")], cx);
-                    cx.spawn(async move |_| { let _ = rx.await; }).detach();
-                });
-            }
+            alert(&crate::localized_format!("无法打开文件：{}", "Could not open file: {}", path.display()), &e.to_string(), cx);
         }
+    }
+}
+
+fn alert(message: &str, detail: &str, cx: &mut App) {
+    if let Some(handle) = cx.active_window().or_else(|| cx.windows().first().copied()) {
+        let _ = handle.update(cx, |_, window, cx| {
+            let rx = window.prompt(PromptLevel::Critical, message, Some(detail), &[tr("确定", "OK")], cx);
+            cx.spawn(async move |_| { let _ = rx.await; }).detach();
+        });
     }
 }
 
@@ -39,13 +41,11 @@ fn open_path(path: &Path, cx: &mut App) -> anyhow::Result<()> {
     let path = path.canonicalize()?;
     for handle in cx.windows().into_iter().filter_map(|w| w.downcast::<LocalFile>()) {
         if handle.update(cx, |preview, window, _| {
-            if preview.path != path { return false; }
+            if preview.file.path != path { return false; }
             window.activate_window(); true
         }).unwrap_or(false) { return Ok(()); }
     }
-    let original = std::fs::read(&path)?;
-    std::str::from_utf8(&original)?;
-    let doc = crate::markdown_file::read(&path, false)?;
+    let (file, doc) = crate::markdown_file::FileDoc::open(&path, crate::markdown_file::TitleFrom::FirstHeading)?;
     let title = format!("{} — quiet.md", path.file_name().unwrap_or_default().to_string_lossy());
     cx.open_window(WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(900.), px(720.)), cx))),
@@ -69,15 +69,14 @@ fn open_path(path: &Path, cx: &mut App) -> anyhow::Result<()> {
         ];
         let this = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| this.update(cx, |file, cx| file.close(false, window, cx)).unwrap_or(true));
-        LocalFile { path, editor, original, saved, dirty: false, error: None, closing: false, _subs: subs }
+        LocalFile { file, editor, saved, dirty: false, error: None, closing: false, _subs: subs }
     }))?;
     Ok(())
 }
 
 struct LocalFile {
-    path: PathBuf,
+    file: crate::markdown_file::FileDoc,
     editor: Entity<Editor>,
-    original: Vec<u8>,
     saved: crate::model::Document,
     dirty: bool,
     error: Option<String>,
@@ -88,14 +87,10 @@ struct LocalFile {
 impl LocalFile {
     fn save(&mut self, cx: &mut Context<Self>) -> bool {
         if !self.dirty { return true; }
-        let doc = &self.editor.read(cx).core.doc;
-        let result = std::fs::read(&self.path).and_then(|bytes| {
-            if bytes != self.original { return Err(std::io::Error::other(tr("文件已被其他程序修改，请重新打开后再保存", "File changed on disk; reopen it before saving"))); }
-            crate::markdown_file::write(&self.path, doc)
-        });
-        match result {
-            Ok(bytes) => { self.original = bytes; self.saved = doc.clone(); self.dirty = false; self.error = None; },
-            Err(e) => self.error = Some(crate::localized_format!("保存失败：{}", "Could not save: {}", e)),
+        let doc = self.editor.read(cx).core.doc.clone();
+        match self.file.save(&doc) {
+            Ok(()) => { self.saved = doc; self.dirty = false; self.error = None; },
+            Err(e) => self.error = Some(save_error(&e)),
         }
         cx.notify();
         self.error.is_none()
@@ -105,7 +100,7 @@ impl LocalFile {
         if !self.dirty { return true; }
         if self.closing { return false; }
         self.closing = true;
-        let message = crate::localized_format!("保存对 {} 的更改？", "Save changes to {}?", self.path.display());
+        let message = crate::localized_format!("保存对 {} 的更改？", "Save changes to {}?", self.file.path.display());
         let rx = window.prompt(PromptLevel::Warning, &message, None, &[tr("保存", "Save"), tr("不保存", "Don't Save"), tr("取消", "Cancel")], cx);
         cx.spawn_in(window, async move |this, cx| {
             let answer = rx.await.ok();
@@ -119,6 +114,13 @@ impl LocalFile {
             });
         }).detach();
         false
+    }
+}
+
+fn save_error(e: &crate::markdown_file::SaveError) -> String {
+    match e {
+        crate::markdown_file::SaveError::Changed => tr("文件已被其他程序修改，请重新打开后再保存", "File changed on disk; reopen it before saving").into(),
+        crate::markdown_file::SaveError::Io(e) => crate::localized_format!("保存失败：{}", "Could not save: {}", e),
     }
 }
 
@@ -141,7 +143,7 @@ impl Render for LocalFile {
             .on_action(|_: &app::Minimize, window, _| window.minimize_window())
             .on_action(|_: &app::Zoom, window, _| window.zoom_window())
             .on_action(|_: &app::ToggleFullScreen, window, _| window.toggle_fullscreen())
-            .child(div().px(px(24.)).py(px(8.)).text_size(px(12.)).text_color(crate::theme::Theme::text_caption()).child(format!("{} · {status}", self.path.display())))
+            .child(div().px(px(24.)).py(px(8.)).text_size(px(12.)).text_color(crate::theme::Theme::text_caption()).child(format!("{} · {status}", self.file.path.display())))
             .child(div().flex_1().min_h_0().child(self.editor.clone()))
     }
 }
