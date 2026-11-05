@@ -213,7 +213,7 @@ enum Docs {
     Library,
     /// A folder of Markdown notes (an Obsidian vault): the library folder,
     /// `<vault>/.quiet-md`, keeps only the index, settings and trash.
-    Vault { vault: crate::vault::Vault, open: std::cell::RefCell<HashMap<String, FileDoc>> },
+    Vault { dir: PathBuf, open: std::cell::RefCell<HashMap<String, FileDoc>> },
 }
 
 pub struct Store {
@@ -354,22 +354,23 @@ impl Store {
 
     /// A vault as the library: its notes are the documents.
     pub fn open_vault(dir: &std::path::Path) -> Result<Self> {
-        let vault = crate::vault::Vault::open(dir)?;
-        let mut store = Self::open_at(vault.root().join(".quiet-md"))?;
-        store.docs = Docs::Vault { vault, open: Default::default() };
+        let dir = dir.canonicalize()?;
+        anyhow::ensure!(dir.is_dir(), "not a folder");
+        let mut store = Self::open_at(dir.join(".quiet-md"))?;
+        store.docs = Docs::Vault { dir, open: Default::default() };
         Ok(store)
     }
 
     /// The vault folder, when the library is one.
     pub fn vault(&self) -> Option<&std::path::Path> {
-        match &self.docs { Docs::Vault { vault, .. } => Some(vault.root()), Docs::Library => None }
+        match &self.docs { Docs::Vault { dir, .. } => Some(dir), Docs::Library => None }
     }
 
     fn path(&self, id: &str) -> PathBuf {
         match &self.docs {
             Docs::Library => self.root.join("docs").join(format!("{id}.xml")),
             // Unknown ids point nowhere, never at the vault itself.
-            Docs::Vault { vault, .. } => self.index.get(id).and_then(|m| m.file.as_ref()).map_or_else(|| self.root.join("trash/.none"), |f| vault.root().join(f.rel())),
+            Docs::Vault { dir, .. } => self.index.get(id).and_then(|m| m.file.as_ref()).map_or_else(|| self.root.join("trash/.none"), |f| dir.join(f.rel())),
         }
     }
 
@@ -388,18 +389,12 @@ impl Store {
     /// Move a vault document to `rel` (`.md` added for a note), numbering the
     /// name on a clash; a folder's notes follow it.
     fn move_in_vault(&mut self, id: &str, rel: &str) -> Result<()> {
-        let (Docs::Vault { vault, .. }, Some(file)) = (&self.docs, self.file(id)) else { return Ok(()) };
-        let ext = if matches!(file, VaultFile::Note(_)) { ".md" } else { "" };
-        let mut new = format!("{rel}{ext}");
-        let mut n = 2;
-        while vault.root().join(&new).exists() && new != file.rel() {
-            new = format!("{rel} {n}{ext}");
-            n += 1;
-        }
+        let (Docs::Vault { dir, .. }, Some(file)) = (&self.docs, self.file(id)) else { return Ok(()) };
+        let new = free_rel(dir, rel, if matches!(file, VaultFile::Note(_)) { ".md" } else { "" }, Some(file.rel()));
         if new == file.rel() { return Ok(()); }
-        let to = vault.root().join(&new);
-        if let Some(dir) = to.parent() { std::fs::create_dir_all(dir)?; }
-        std::fs::rename(vault.root().join(file.rel()), &to)?;
+        let to = dir.join(&new);
+        if let Some(parent) = to.parent() { std::fs::create_dir_all(parent)?; }
+        std::fs::rename(dir.join(file.rel()), &to)?;
         let old = format!("{}/", file.rel());
         for m in self.index.values_mut() {
             let Some(f) = &m.file else { continue };
@@ -412,28 +407,22 @@ impl Store {
     /// The vault scanned into the index: new files adopted, gone ones dropped,
     /// parents and modification times taken from the folders.
     fn sync_vault(&mut self) -> bool {
-        let Docs::Vault { vault, .. } = &self.docs else { return false };
-        let root = vault.root().to_path_buf();
-        let items = vault.scan();
+        let Docs::Vault { dir, .. } = &self.docs else { return false };
+        let dir = dir.clone();
         let mut ids: HashMap<VaultFile, String> = self.index.iter().filter_map(|(id, m)| m.file.clone().map(|f| (f, id.clone()))).collect();
         let mut seen = std::collections::HashSet::new();
         let mut dirty = false;
-        for item in items {
-            let rel_path = item.path.strip_prefix(&root).unwrap_or(&item.path);
-            let parent = rel_path.parent().filter(|p| !p.as_os_str().is_empty()).map(|p| p.to_string_lossy().replace('\\', "/"));
-            let rel = match (&parent, item.kind) {
-                (_, crate::vault::ItemKind::Folder) => rel_path.to_string_lossy().replace('\\', "/"),
-                (Some(p), _) => format!("{p}/{}.md", item.name),
-                (None, _) => format!("{}.md", item.name),
-            };
+        for item in crate::vault::scan(&dir) {
+            let folder = item.kind == crate::vault::ItemKind::Folder;
+            let rel_path = item.path.strip_prefix(&dir).unwrap_or(&item.path);
+            let rel = if folder { rel_path.to_path_buf() } else { rel_path.with_file_name(format!("{}.md", item.name)) }.to_string_lossy().replace('\\', "/");
+            let parent = rel.rsplit_once('/').and_then(|(p, _)| ids.get(&VaultFile::Folder(p.to_string())).cloned());
             if item.kind == crate::vault::ItemKind::Evicted {
                 let _ = std::process::Command::new("brctl").arg("download").arg(&item.path).status();
             }
-            let file = if item.kind == crate::vault::ItemKind::Folder { VaultFile::Folder(rel) } else { VaultFile::Note(rel) };
+            let file = if folder { VaultFile::Folder(rel) } else { VaultFile::Note(rel) };
             let mtime = std::fs::metadata(&item.path).ok().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or_else(now, |d| d.as_secs());
             let id = ids.entry(file.clone()).or_insert_with(|| uuid::Uuid::new_v4().to_string()).clone();
-            let folder = matches!(file, VaultFile::Folder(_));
-            let parent = parent.and_then(|p| ids.get(&VaultFile::Folder(p)).cloned());
             let m = self.index.entry(id.clone()).or_insert_with(|| {
                 dirty = true;
                 // A folder's page only lists its notes.
@@ -469,6 +458,14 @@ impl Store {
         save_json(&self.root.join("index.json"), &self.index)
     }
 
+    /// Rescan a vault without reading its notes; true when something changed.
+    pub fn refresh(&mut self) -> bool {
+        let _lock = self.begin_write();
+        let changed = self.sync_vault();
+        if changed { let _ = self.save_index(); }
+        changed
+    }
+
     /// All documents found on disk. A `.xml` file dropped into `docs/` by hand
     /// is picked up too.
     pub fn list(&mut self) -> Vec<Entry> {
@@ -477,7 +474,7 @@ impl Store {
             if self.sync_vault() { let _ = self.save_index(); }
             let ids: Vec<String> = self.index.iter().filter(|(_, m)| m.file.is_some()).map(|(id, _)| id.clone()).collect();
             return ids.into_iter().map(|id| {
-                let doc = self.read(&id).unwrap_or_default();
+                let doc = self.load(&id).unwrap_or_default();
                 let meta = self.index[&id].clone();
                 let title = meta.file.as_ref().map(|f| f.name().to_string()).unwrap_or_default();
                 Entry { id, meta, title, icon: None, body: doc.plain_text(), reminders: doc.reminders(), links: doc.doc_links() }
@@ -513,7 +510,7 @@ impl Store {
         out
     }
 
-    fn read(&self, id: &str) -> Result<Document> {
+    pub fn load(&self, id: &str) -> Result<Document> {
         match (&self.docs, self.file(id)) {
             (Docs::Library, _) => docxml::parse(&std::fs::read_to_string(self.path(id))?),
             (Docs::Vault { .. }, Some(VaultFile::Folder(rel))) => Ok(folder_page(&VaultFile::Folder(rel))),
@@ -521,15 +518,11 @@ impl Store {
         }
     }
 
-    pub fn load(&self, id: &str) -> Result<Document> {
-        self.read(id)
-    }
-
     /// Only opening an editor establishes a new save baseline; previews must
     /// not hide external changes from an already open editor.
     pub fn load_for_edit(&self, id: &str, shared: bool) -> Result<Document> {
         if let Docs::Vault { open, .. } = &self.docs {
-            if !matches!(self.file(id), Some(VaultFile::Note(_))) { return self.read(id); }
+            if !matches!(self.file(id), Some(VaultFile::Note(_))) { return self.load(id); }
             let (file, doc) = FileDoc::open(&self.path(id), TitleFrom::FileName)?;
             if !shared { open.borrow_mut().insert(id.to_string(), file); }
             return Ok(doc);
@@ -547,7 +540,7 @@ impl Store {
 
     /// `save` for callers that already hold the write lock.
     fn save_now(&mut self, id: &str, doc: &Document) -> Result<Meta> {
-        if self.vault().is_some() { return self.save_note(id, doc); }
+        if let Docs::Vault { dir, .. } = &self.docs { let dir = dir.clone(); return self.save_note(id, doc, &dir); }
         let xml = docxml::serialize(doc);
         if let Some(previous) = self.loaded.borrow().get(id) {
             let disk = std::fs::read_to_string(self.path(id))?;
@@ -565,16 +558,13 @@ impl Store {
 
     /// Vault `save`: the title is the file name, so a new title renames the
     /// file; a new document becomes a new note.
-    fn save_note(&mut self, id: &str, doc: &Document) -> Result<Meta> {
+    fn save_note(&mut self, id: &str, doc: &Document, dir: &std::path::Path) -> Result<Meta> {
         let name = file_name(&doc.title.text);
         let t = now();
         match self.file(id) {
             None => {
-                let Docs::Vault { vault, .. } = &self.docs else { unreachable!() };
-                let mut rel = format!("{name}.md");
-                let mut n = 2;
-                while vault.root().join(&rel).exists() { rel = format!("{name} {n}.md"); n += 1; }
-                crate::markdown_file::create(&vault.root().join(&rel), doc)?;
+                let rel = free_rel(dir, &name, ".md", None);
+                crate::markdown_file::create(&dir.join(&rel), doc)?;
                 self.index.insert(id.to_string(), Meta { created: t, modified: t, file: Some(VaultFile::Note(rel)), ..Default::default() });
             }
             Some(file) => {
@@ -585,10 +575,8 @@ impl Store {
                 if let (Docs::Vault { open, .. }, VaultFile::Note(_)) = (&self.docs, &file) {
                     let path = self.path(id);
                     let mut open = open.borrow_mut();
-                    let f = match open.entry(id.to_string()) {
-                        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                        std::collections::hash_map::Entry::Vacant(e) => e.insert(FileDoc::open(&path, TitleFrom::FileName)?.0),
-                    };
+                    if !open.contains_key(id) { open.insert(id.to_string(), FileDoc::open(&path, TitleFrom::FileName)?.0); }
+                    let Some(f) = open.get_mut(id) else { unreachable!() };
                     f.path = path;
                     f.save(doc).map_err(|e| match e {
                         SaveError::Changed => anyhow::anyhow!("文档已被另一个实例修改，未覆盖磁盘内容。请先将当前内容导出，再重新打开文档"),
@@ -738,7 +726,7 @@ impl Store {
         let cutoff = now().saturating_sub(TRASH_DAYS * 86_400);
         let expired: Vec<String> = self.trash.iter().filter(|(_, t)| t.deleted <= cutoff).map(|(k, _)| k.clone()).collect();
         for id in expired {
-            match std::fs::remove_file(self.trash_path(&id)) {
+            match remove_entry(&self.trash_path(&id)) {
                 Ok(()) => { self.trash.remove(&id); dirty = true; }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => { self.trash.remove(&id); dirty = true; }
                 Err(e) => self.warnings.push(format!("无法清理过期回收站文档 {id}：{e}")),
@@ -808,8 +796,7 @@ impl Store {
     pub fn purge(&mut self, id: &str) -> Result<()> {
         let _lock = self.begin_write();
         for k in self.trash_group(id) {
-            let p = self.trash_path(&k);
-            match if p.is_dir() { std::fs::remove_dir_all(p) } else { std::fs::remove_file(p) } {
+            match remove_entry(&self.trash_path(&k)) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e.into()),
@@ -915,6 +902,23 @@ impl Store {
         }
         self.save_index()
     }
+}
+
+/// `stem` + `ext`, numbered ("Name 2") past names taken in `dir`; `keep`, the
+/// current name, counts as free.
+fn free_rel(dir: &std::path::Path, stem: &str, ext: &str, keep: Option<&str>) -> String {
+    let mut rel = format!("{stem}{ext}");
+    let mut n = 2;
+    while dir.join(&rel).exists() && keep != Some(rel.as_str()) {
+        rel = format!("{stem} {n}{ext}");
+        n += 1;
+    }
+    rel
+}
+
+/// A trashed note or folder.
+fn remove_entry(p: &std::path::Path) -> std::io::Result<()> {
+    if p.is_dir() { std::fs::remove_dir_all(p) } else { std::fs::remove_file(p) }
 }
 
 /// A vault folder's page: its notes, as a 子页面列表.

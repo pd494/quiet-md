@@ -17,6 +17,7 @@ impl SharedStore {
     pub fn switch(&self, store: Store) { *self.0.borrow_mut() = store; }
     pub fn vault(&self) -> Option<std::path::PathBuf> { self.0.borrow().vault().map(|p| p.to_path_buf()) }
     pub fn changed_on_disk(&self, id: &str) -> bool { self.0.borrow().changed_on_disk(id) }
+    pub fn refresh(&self) -> bool { self.0.borrow_mut().refresh() }
     pub fn take_warnings(&self) -> Vec<String> { std::mem::take(&mut self.0.borrow_mut().warnings) }
     pub fn list(&mut self) -> Vec<Entry> { self.0.borrow_mut().list() }
     pub fn load(&self, id: &str) -> Result<Document> { self.0.borrow_mut().load(id) }

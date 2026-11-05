@@ -686,15 +686,13 @@ impl Workspace {
             tr("在文件资源管理器中显示", "Show in File Explorer")
         } else { tr("在文件管理器中显示", "Show in File Manager") };
         // The library, then every vault added, the one in use marked.
-        let mut vaults = prefs().vaults;
-        if let Some(v) = &vault && !vaults.contains(v) { vaults.push(v.clone()); }
+        let vaults = prefs().vaults;
         let choice = |ix: usize, target: Option<std::path::PathBuf>, cx: &mut Context<Self>| {
             if target == vault { return div().px(px(4.)).text_size(px(12.)).text_color(Theme::text_caption()).child(tr("使用中", "In use")); }
-            let forget = target.clone();
             div().flex().items_center().gap(px(8.))
-                .when_some(forget, |d, path| d.child(link_button(SharedString::from(format!("vault-remove-{ix}")), tr("移除", "Remove"))
+                .when_some(target.clone(), |d, path| d.child(link_button(SharedString::from(format!("vault-remove-{ix}")), tr("移除", "Remove"))
                     .on_click(cx.listener(move |w, _, _, cx| w.forget_vault(&path, cx)))))
-                .child(button(SharedString::from(format!("vault-use-{ix}")), tr("使用", "Use")).on_click(cx.listener(move |w, _, window, cx| w.use_library(target.clone(), window, cx))))
+                .child(button(SharedString::from(format!("vault-use-{ix}")), tr("使用", "Use")).on_click(cx.listener(move |w, _, _, cx| w.use_library(target.clone(), cx))))
         };
         let mut sources = vec![row(tr("文档库", "Library"), Some(shown(&crate::store::Store::root_dir()).into()), choice(0, None, cx)).into_any_element()];
         for (i, v) in vaults.iter().enumerate() {

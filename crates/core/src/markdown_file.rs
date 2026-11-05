@@ -44,11 +44,12 @@ fn resolve_images(blocks: &mut [Block], base: &Path) {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum TitleFrom {
     /// The leading `# heading`, if any.
     FirstHeading,
     /// The file name; a leading `# heading` that repeats it is folded in.
+    #[default]
     FileName,
 }
 
@@ -65,6 +66,7 @@ struct Segment {
 
 /// The file as read. A save writes back verbatim each segment whose blocks
 /// are unchanged, so an edit rewrites only what was edited.
+#[derive(Default)]
 struct Layout {
     title_from: TitleFrom,
     /// Frontmatter and blank lines before the body.
@@ -95,7 +97,7 @@ fn split_groups(text: &str) -> Vec<&str> {
             out.push(&text[start..pos]);
             start = pos;
         }
-        if line.trim().starts_with("```") || line.trim().starts_with("~~~") { fence = !fence; }
+        if is_fence(line) { fence = !fence; }
         pos += line.len();
     }
     if start < pos { out.push(&text[start..]); }
@@ -130,12 +132,22 @@ fn split_segments(text: &str) -> Vec<(&str, &str)> {
             out.push((&text[start..end], &text[end..pos]));
             start = pos;
         }
-        if t.starts_with("```") || t.starts_with("~~~") { fence = !fence; }
+        if is_fence(line) { fence = !fence; }
         pos += line.len();
         if !t.is_empty() || fence { end = pos; }
     }
     if start < pos { out.push((&text[start..end], &text[end..])); }
     out
+}
+
+fn is_fence(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("```") || t.starts_with("~~~")
+}
+
+/// Blocks equal apart from their ids, which every parse makes anew.
+fn same(a: &[Block], b: &[Block]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.kind == y.kind && x.text == y.text && x.align == y.align && x.bg == y.bg && x.folded == y.folded && same(&x.children, &y.children))
 }
 
 fn relative(blocks: &mut [Block], base: &Path) {
@@ -191,15 +203,17 @@ fn parse(text: &str, path: &Path, title_from: TitleFrom) -> (Document, Layout) {
         // same blocks (lines of a paragraph, items of a list), so an edit
         // rewrites only its own lines.
         let groups = split_groups(src);
-        let parts: Vec<_> = groups.iter().map(|g| blocks_of(g)).collect();
-        if groups.len() > 1 && parts.iter().all(|b| !b.is_empty()) && parts.iter().map(Vec::len).sum::<usize>() == blocks.len() {
-            let last = groups.len() - 1;
-            for (n, (group, blocks)) in groups.into_iter().zip(parts).enumerate() {
-                push(group, if n == last { tail } else { "" }, blocks);
+        if groups.len() > 1 {
+            let parts: Vec<_> = groups.iter().map(|g| blocks_of(g)).collect();
+            if parts.iter().all(|b| !b.is_empty()) && parts.iter().map(Vec::len).sum::<usize>() == blocks.len() {
+                let last = groups.len() - 1;
+                for (n, (group, blocks)) in groups.into_iter().zip(parts).enumerate() {
+                    push(group, if n == last { tail } else { "" }, blocks);
+                }
+                continue;
             }
-        } else {
-            push(src, tail, blocks);
         }
+        push(src, tail, blocks);
     }
     if layout.segments.is_empty() {
         layout.segments.push(Segment { text: String::new(), tail: String::new(), blocks: vec![Block::text("")], ix: 0 });
@@ -208,8 +222,8 @@ fn parse(text: &str, path: &Path, title_from: TitleFrom) -> (Document, Layout) {
     (Document { title, icon: None, cover: None, blocks }, layout)
 }
 
-/// The file's new text, and the layout it now has.
-fn render(doc: &Document, layout: &Layout, base: &Path) -> (String, Layout) {
+/// The file's new text, its title line and its segments now.
+fn render(doc: &Document, layout: &Layout, base: &Path) -> (String, Option<String>, Vec<Segment>) {
     let export = |title: RichText, blocks: &[Block]| {
         let mut d = Document { title, icon: None, cover: None, blocks: blocks.to_vec() };
         relative(&mut d.blocks, base);
@@ -221,29 +235,34 @@ fn render(doc: &Document, layout: &Layout, base: &Path) -> (String, Layout) {
         _ => layout.head.clone(),
     };
     let mut chunks: Vec<Segment> = vec![];
-    let mut run: Vec<Block> = vec![];
-    // An edited run takes the place, and the tail, of the segment its last block came from.
-    let flush = |run: &mut Vec<Block>, chunks: &mut Vec<Segment>| {
-        let Some(last) = run.last() else { return };
-        let from = layout.segments.iter().find(|s| s.blocks.iter().any(|b| b.id == last.id));
+    // Edited blocks `start..end`, exported with their list numbers, take the
+    // place and tail of the segment the last one came from.
+    let flush = |start: usize, end: usize, chunks: &mut Vec<Segment>| {
+        if start == end { return; }
+        let mut run = doc.blocks[start..end].to_vec();
+        let mut n = 0;
+        for (k, b) in doc.blocks[..end].iter().enumerate() {
+            n = match b.kind { BlockKind::Ordered { seq } => seq.unwrap_or(n + 1), _ => 0 };
+            if let (true, BlockKind::Ordered { seq }) = (k >= start, &mut run[k.saturating_sub(start)].kind) { *seq = Some(n); }
+        }
+        let from = layout.segments.iter().find(|s| s.blocks.iter().any(|b| b.id == doc.blocks[end - 1].id));
         let (tail, ix) = from.map_or((String::new(), usize::MAX), |s| (s.tail.clone(), s.ix));
-        chunks.push(Segment { text: export(RichText::default(), run), tail, blocks: std::mem::take(run), ix });
+        chunks.push(Segment { text: export(RichText::default(), &run), tail, blocks: doc.blocks[start..end].to_vec(), ix });
     };
-    let mut i = 0;
+    let (mut i, mut start) = (0, 0);
     while i < doc.blocks.len() {
-        match layout.segments.iter().find(|s| doc.blocks[i..].starts_with(&s.blocks)) {
+        let rest = &doc.blocks[i..];
+        match layout.segments.iter().find(|s| rest.len() >= s.blocks.len() && same(&rest[..s.blocks.len()], &s.blocks)) {
             Some(s) => {
-                flush(&mut run, &mut chunks);
-                chunks.push(s.clone());
+                flush(start, i, &mut chunks);
+                chunks.push(Segment { blocks: rest[..s.blocks.len()].to_vec(), ..s.clone() });
                 i += s.blocks.len();
+                start = i;
             }
-            None => {
-                run.push(doc.blocks[i].clone());
-                i += 1;
-            }
+            None => i += 1,
         }
     }
-    flush(&mut run, &mut chunks);
+    flush(start, i, &mut chunks);
     for n in 1..chunks.len() {
         let adjacent = chunks[n].ix == chunks[n - 1].ix.wrapping_add(1);
         let lists = chunks[n - 1].blocks.last().is_some_and(|b| b.kind.is_list()) && chunks[n].blocks.first().is_some_and(|b| b.kind.is_list());
@@ -255,15 +274,13 @@ fn render(doc: &Document, layout: &Layout, base: &Path) -> (String, Layout) {
     }
     for (ix, c) in chunks.iter_mut().enumerate() { c.ix = ix; }
     let body: String = chunks.iter().flat_map(|c| [c.text.as_str(), c.tail.as_str()]).collect();
-    let text = format!("{}{}{body}", layout.front, head.as_deref().unwrap_or_default());
-    (text, Layout { title_from: layout.title_from, front: layout.front.clone(), head, title: doc.title.clone(), segments: chunks, list_indent: layout.list_indent.clone(), bullet: layout.bullet })
+    (format!("{}{}{body}", layout.front, head.as_deref().unwrap_or_default()), head, chunks)
 }
 
 /// A new note holding `doc`, titled by its file name; never overwrites.
 pub fn create(path: &Path, doc: &Document) -> std::io::Result<()> {
     use std::io::Write;
-    let layout = Layout { title_from: TitleFrom::FileName, front: String::new(), head: None, title: doc.title.clone(), segments: vec![], list_indent: None, bullet: None };
-    let text = render(doc, &layout, path.parent().unwrap_or(Path::new("."))).0;
+    let text = render(doc, &Layout::default(), path.parent().unwrap_or(Path::new("."))).0;
     std::fs::OpenOptions::new().write(true).create_new(true).open(path)?.write_all(text.as_bytes())
 }
 
@@ -277,15 +294,6 @@ pub enum SaveError {
     /// Another program wrote the file since it was read.
     Changed,
     Io(std::io::Error),
-}
-
-impl std::fmt::Display for SaveError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SaveError::Changed => f.write_str("the file changed on disk"),
-            SaveError::Io(e) => e.fmt(f),
-        }
-    }
 }
 
 /// A Markdown file edited in place. A save checks the file still holds
@@ -311,7 +319,7 @@ impl FileDoc {
     pub fn save(&mut self, doc: &Document) -> Result<(), SaveError> {
         use std::io::Write;
         if self.changed_on_disk() { return Err(SaveError::Changed); }
-        let (text, layout) = render(doc, &self.layout, self.path.parent().unwrap_or(Path::new(".")));
+        let (text, head, segments) = render(doc, &self.layout, self.path.parent().unwrap_or(Path::new(".")));
         let permissions = std::fs::metadata(&self.path).map_err(SaveError::Io)?.permissions();
         if permissions.readonly() { return Err(SaveError::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "File is read-only"))); }
         let temp = self.path.with_file_name(format!(".quiet-md-{}.tmp", uuid::Uuid::new_v4()));
@@ -325,7 +333,9 @@ impl FileDoc {
         })();
         if result.is_err() { let _ = std::fs::remove_file(temp); }
         result.map_err(SaveError::Io)?;
-        self.layout = layout;
+        self.layout.head = head;
+        self.layout.title = doc.title.clone();
+        self.layout.segments = segments;
         self.original = text.into_bytes();
         Ok(())
     }
@@ -441,6 +451,21 @@ mod tests {
         core.insert_text("the ");
         assert!(file.save(&core.doc).is_ok());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "* parent\n\t* the child\n* other\n");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_edited_list_item_keeps_its_number() {
+        use crate::editor::core::{Core, Pos, Selection};
+        let dir = temp("ordered");
+        let path = dir.join("note.md");
+        std::fs::write(&path, "1. a\n2. b\n3. c\n").unwrap();
+        let (mut file, doc) = FileDoc::open(&path, TitleFrom::FileName).unwrap();
+        let mut core = Core::new(doc);
+        core.sel = Selection::caret(Pos::new(core.doc.blocks[2].id, 0));
+        core.insert_text("the ");
+        assert!(file.save(&core.doc).is_ok());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "1. a\n2. b\n3. the c\n");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

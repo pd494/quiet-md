@@ -20,17 +20,15 @@ pub fn install(cx: &mut App) {
 pub fn open_paths(paths: &[PathBuf], cx: &mut App) {
     for path in paths {
         if let Err(e) = open_path(path, cx) {
-            alert(&crate::localized_format!("无法打开文件：{}", "Could not open file: {}", path.display()), &e.to_string(), cx);
+            let message = crate::localized_format!("无法打开文件：{}", "Could not open file: {}", path.display());
+            let detail = e.to_string();
+            if let Some(handle) = cx.active_window().or_else(|| cx.windows().first().copied()) {
+                let _ = handle.update(cx, |_, window, cx| {
+                    let rx = window.prompt(PromptLevel::Critical, &message, Some(&detail), &[tr("确定", "OK")], cx);
+                    cx.spawn(async move |_| { let _ = rx.await; }).detach();
+                });
+            }
         }
-    }
-}
-
-fn alert(message: &str, detail: &str, cx: &mut App) {
-    if let Some(handle) = cx.active_window().or_else(|| cx.windows().first().copied()) {
-        let _ = handle.update(cx, |_, window, cx| {
-            let rx = window.prompt(PromptLevel::Critical, message, Some(detail), &[tr("确定", "OK")], cx);
-            cx.spawn(async move |_| { let _ = rx.await; }).detach();
-        });
     }
 }
 
@@ -90,7 +88,8 @@ impl LocalFile {
         let doc = self.editor.read(cx).core.doc.clone();
         match self.file.save(&doc) {
             Ok(()) => { self.saved = doc; self.dirty = false; self.error = None; },
-            Err(e) => self.error = Some(save_error(&e)),
+            Err(crate::markdown_file::SaveError::Changed) => self.error = Some(tr("文件已被其他程序修改，请重新打开后再保存", "File changed on disk; reopen it before saving").into()),
+            Err(crate::markdown_file::SaveError::Io(e)) => self.error = Some(crate::localized_format!("保存失败：{}", "Could not save: {}", e)),
         }
         cx.notify();
         self.error.is_none()
@@ -114,13 +113,6 @@ impl LocalFile {
             });
         }).detach();
         false
-    }
-}
-
-fn save_error(e: &crate::markdown_file::SaveError) -> String {
-    match e {
-        crate::markdown_file::SaveError::Changed => tr("文件已被其他程序修改，请重新打开后再保存", "File changed on disk; reopen it before saving").into(),
-        crate::markdown_file::SaveError::Io(e) => crate::localized_format!("保存失败：{}", "Could not save: {}", e),
     }
 }
 
